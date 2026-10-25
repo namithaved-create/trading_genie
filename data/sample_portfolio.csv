@@ -1,0 +1,8 @@
+symbol,name,type,sector,shares,price,expense_ratio
+AAPL,Apple Inc.,stock,Technology,60,228.50,
+NVDA,NVIDIA Corp.,stock,Technology,45,135.20,
+TSLA,Tesla Inc.,stock,Consumer Discretionary,12,250.10,
+VOO,Vanguard S&P 500 ETF,fund,Broad Market,8,525.00,0.03%
+ARKK,ARK Innovation ETF,fund,Technology,40,48.75,0.75%
+AGTHX,American Funds Growth Fund of America,fund,Diversified,50,72.40,0.59%
+CASH,Cash,cash,Cash,1,3500.00,
