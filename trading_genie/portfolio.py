@@ -18,7 +18,20 @@ SINGLE_STOCK_SEVERE = 0.35
 SECTOR_LIMIT = 0.40  # one sector above 40% (ignoring broad funds and cash)
 HIGH_EXPENSE_RATIO = 0.0050  # funds charging more than 0.50% a year
 CASH_LIMIT = 0.20
+OPTIONS_LIMIT = 0.10  # options above 10% of the portfolio
+OPTIONS_SEVERE = 0.25
+OPTIONS_MAJORITY = 0.50  # above this, the score is capped
+OPTIONS_MAJORITY_MAX_SCORE = 40
 MIN_EFFECTIVE_HOLDINGS = 5
+
+KINDS = {"stock", "fund", "cash", "option", "crypto"}
+KIND_ALIASES = {
+    "etf": "fund", "mutual fund": "fund", "index fund": "fund",
+    "options": "option", "call": "option", "put": "option",
+    "cryptocurrency": "crypto",
+}
+# Kinds that are a bet on a single company or asset, not a basket.
+SINGLE_ASSET_KINDS = {"stock", "option", "crypto"}
 
 # Holdings that are already spread across many companies.
 DIVERSIFIED_SECTORS = {"diversified", "broad market", "bonds", "cash"}
@@ -28,9 +41,9 @@ DIVERSIFIED_SECTORS = {"diversified", "broad market", "bonds", "cash"}
 class Holding:
     symbol: str
     name: str
-    shares: float
-    price: float
-    kind: str  # "stock", "fund" or "cash"
+    shares: float  # contracts, for options
+    price: float  # value of one contract (quoted price x 100), for options
+    kind: str  # "stock", "fund", "cash", "option" or "crypto"
     sector: str
     expense_ratio: float  # as a fraction, e.g. 0.0003 for 0.03%
 
@@ -108,8 +121,8 @@ def parse_holdings(text: str) -> list[Holding]:
         if not row.get("symbol"):
             continue
         kind = (row.get("type") or "stock").lower()
-        if kind not in {"stock", "fund", "cash"}:
-            kind = "fund" if kind in {"etf", "mutual fund", "index fund"} else "stock"
+        if kind not in KINDS:
+            kind = KIND_ALIASES.get(kind, "stock")
         holdings.append(
             Holding(
                 symbol=row["symbol"].upper(),
@@ -131,29 +144,44 @@ def analyze(holdings: list[Holding]) -> HealthReport:
     if total <= 0:
         raise ValueError("Portfolio total value must be greater than zero")
 
-    weights = {h.symbol: h.value / total for h in holdings}
+    # Weights are per row: a symbol can appear more than once, e.g. a stock
+    # and options on it, or two option contracts.
+    weights = [h.value / total for h in holdings]
 
     sector_weights: dict[str, float] = {}
     kind_weights: dict[str, float] = {}
-    for h in holdings:
-        sector_weights[h.sector] = sector_weights.get(h.sector, 0) + weights[h.symbol]
-        kind_weights[h.kind] = kind_weights.get(h.kind, 0) + weights[h.symbol]
+    # Exposure to each single company or asset, adding options to the stock.
+    exposure: dict[str, float] = {}
+    names: dict[str, str] = {}
+    has_options: set[str] = set()
+    for h, w in zip(holdings, weights):
+        sector_weights[h.sector] = sector_weights.get(h.sector, 0) + w
+        kind_weights[h.kind] = kind_weights.get(h.kind, 0) + w
+        if h.kind in SINGLE_ASSET_KINDS:
+            exposure[h.symbol] = exposure.get(h.symbol, 0) + w
+            if h.kind == "option":
+                has_options.add(h.symbol)
+            else:
+                names[h.symbol] = h.name
 
-    weighted_er = sum(weights[h.symbol] * h.expense_ratio for h in holdings)
+    weighted_er = sum(w * h.expense_ratio for h, w in zip(holdings, weights))
     annual_fees = sum(h.value * h.expense_ratio for h in holdings)
 
     # Effective number of holdings (inverse Herfindahl index). A broad index
-    # fund counts as many holdings, so only stocks are concentrated bets.
-    stock_weights = [weights[h.symbol] for h in holdings if h.kind == "stock"]
-    diversified_weight = 1 - sum(stock_weights)
-    hhi = sum(w * w for w in stock_weights)
+    # fund counts as many holdings, so only single assets are concentrated bets.
+    single_weights = list(exposure.values())
+    diversified_weight = 1 - sum(single_weights)
+    hhi = sum(w * w for w in single_weights)
     effective = (1 / hhi) if hhi > 0 else float("inf")
     if diversified_weight > 0:
         # Treat the diversified part as spread thinly across a large market.
         effective = 1 / (hhi + (diversified_weight**2) / 500)
 
-    flags = _build_flags(holdings, weights, sector_weights, kind_weights, effective)
+    flags = _build_flags(holdings, exposure, names, has_options, sector_weights, kind_weights, effective)
     score = _score(flags)
+    # Many small flags can't capture a portfolio that's mostly options.
+    if kind_weights.get("option", 0) > OPTIONS_MAJORITY:
+        score = min(score, OPTIONS_MAJORITY_MAX_SCORE)
 
     holding_rows = [
         {
@@ -162,11 +190,11 @@ def analyze(holdings: list[Holding]) -> HealthReport:
             "type": h.kind,
             "sector": h.sector,
             "value": round(h.value, 2),
-            "weight_pct": round(weights[h.symbol] * 100, 1),
+            "weight_pct": round(w * 100, 1),
             "expense_ratio_pct": round(h.expense_ratio * 100, 3),
             "annual_fee": round(h.value * h.expense_ratio, 2),
         }
-        for h in sorted(holdings, key=lambda h: h.value, reverse=True)
+        for h, w in sorted(zip(holdings, weights), key=lambda hw: hw[0].value, reverse=True)
     ]
 
     return HealthReport(
@@ -182,21 +210,44 @@ def analyze(holdings: list[Holding]) -> HealthReport:
     )
 
 
-def _build_flags(holdings, weights, sector_weights, kind_weights, effective) -> list[Flag]:
+def _build_flags(holdings, exposure, names, has_options, sector_weights, kind_weights, effective) -> list[Flag]:
     flags: list[Flag] = []
 
-    for h in holdings:
-        w = weights[h.symbol]
-        if h.kind == "stock" and w > SINGLE_STOCK_LIMIT:
+    for symbol, w in exposure.items():
+        if w > SINGLE_STOCK_LIMIT:
+            name = names.get(symbol, symbol)
+            if symbol in has_options:
+                # Puts gain when the stock falls, so don't assume a direction.
+                detail = (
+                    f"Over {SINGLE_STOCK_LIMIT:.0%} of your money depends on how {name}'s stock moves, "
+                    "so one big move, up or down, could noticeably change your whole portfolio."
+                )
+            else:
+                detail = (
+                    f"A single company above {SINGLE_STOCK_LIMIT:.0%} means one bad year for "
+                    f"{name} could noticeably dent your whole portfolio."
+                )
             flags.append(
                 Flag(
                     "concentration",
                     "high" if w > SINGLE_STOCK_SEVERE else "medium",
-                    f"{h.symbol} is {w:.0%} of your portfolio",
-                    f"A single company above {SINGLE_STOCK_LIMIT:.0%} means one bad year for "
-                    f"{h.name} could noticeably dent your whole portfolio.",
+                    f"{symbol} is {w:.0%} of your portfolio",
+                    detail,
                 )
             )
+
+    options = kind_weights.get("option", 0)
+    if options > OPTIONS_LIMIT:
+        flags.append(
+            Flag(
+                "options",
+                "high" if options > OPTIONS_SEVERE else "medium",
+                f"{options:.0%} of your portfolio is in options",
+                "An option is a contract that can expire worthless: if the stock doesn't move "
+                "far enough before the expiration date, you can lose everything you paid for it. "
+                "Options also swing in value much faster than the stocks they're tied to.",
+            )
+        )
 
     for sector, w in sector_weights.items():
         if sector.lower() in DIVERSIFIED_SECTORS or sector == "Unknown":

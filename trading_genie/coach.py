@@ -19,7 +19,7 @@ You will receive a JSON health report computed by code. Treat its numbers as \
 facts; do not invent prices, returns or holdings that aren't in it.
 
 Write in plain language a smart non-expert understands. When you use a term like \
-diversification, concentration risk, sector, expense ratio or index fund, explain \
+diversification, concentration risk, sector, expense ratio, index fund or option, explain \
 it in one short sentence the first time, using her actual holdings as the example.
 
 Structure your answer in Markdown with these sections:
